@@ -148,10 +148,10 @@ def handle_callback_query(callback_query: dict):
         with open(cookies_path, "w", encoding="utf-8") as cf:
             cf.write(cookies_clean)
         ydl_opts['cookiefile'] = cookies_path
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'mweb']}}
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios', 'android', 'mweb', 'web']}}
         logger.info(f"YOUTUBE_COOKIES loaded ({len(cookies_clean)} chars)")
     else:
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['mweb', 'tv']}}
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios', 'android', 'mweb']}}
         logger.info("No YOUTUBE_COOKIES found in env")
 
     if is_audio:
