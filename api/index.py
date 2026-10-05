@@ -1,50 +1,33 @@
 """
-api/index.py
-Flask-based Vercel Serverless Telegram Bot Webhook
-Downloads YouTube Shorts & Facebook Reels under 20MB and sends directly to Telegram.
-Includes m.facebook.com routing, authenticated web/mweb player_client with YOUTUBE_COOKIES,
-and fallback resolver.
+api/index.py - Telegram Bot Webhook
 """
-
 import os
 import re
 import glob
 import uuid
 import logging
 from urllib.parse import urlparse
-
 from flask import Flask, request, jsonify
 import requests
 import yt_dlp
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telegram_webhook_bot")
-
-# Initialize Flask app
 app = Flask(__name__)
 
-# Config & Limits
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-MAX_FILESIZE_BYTES = 20 * 1024 * 1024  # 20MB limit
+MAX_FILESIZE_BYTES = 20 * 1024 * 1024
 
 DESKTOP_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-}
-
-MOBILE_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
-
 def send_telegram_request(method: str, data: dict = None, files: dict = None, timeout: int = 40):
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("CRITICAL: TELEGRAM_BOT_TOKEN environment variable is not set in Vercel settings!")
+        logger.error("TELEGRAM_BOT_TOKEN is missing!")
         return None
     url = f"{TELEGRAM_API_BASE}/{method}"
     try:
@@ -54,138 +37,44 @@ def send_telegram_request(method: str, data: dict = None, files: dict = None, ti
             res = requests.post(url, json=data, timeout=timeout)
         return res.json()
     except Exception as e:
-        logger.error(f"Error calling Telegram method {method}: {e}", exc_info=True)
+        logger.error(f"Telegram error {method}: {e}")
         return None
 
-
 def extract_url(text: str) -> str:
-    """Extracts first http/https URL from text."""
     if not text:
         return ""
-    match = re.search(r"https?://[^\s]+", text)
-    return match.group(0) if match else ""
-
+    m = re.search(r"https?://[^\s]+", text)
+    return m.group(0) if m else ""
 
 def resolve_facebook_url(raw_url: str) -> str:
-    """
-    Resolves Facebook /share/r/ or fb.watch links and converts to mobile
-    https://m.facebook.com/watch/?v=<id>.
-    """
     url = raw_url.strip().rstrip(").,;!?\"'")
     reel_id = None
-
-    match_direct = re.search(r"/(?:reel|videos)/(\d+)", url)
-    if match_direct:
-        reel_id = match_direct.group(1)
-
-    watch_direct = re.search(r"[?&]v=(\d+)", url)
-    if watch_direct:
-        reel_id = watch_direct.group(1)
-
+    m = re.search(r"/(?:reel|videos)/(\d+)", url) or re.search(r"[?&]v=(\d+)", url)
+    if m:
+        reel_id = m.group(1)
     if not reel_id and ("facebook.com/share" in url or "fb.watch" in url):
         try:
-            logger.info(f"Resolving Facebook share link: {url}")
-            session = requests.Session()
-            session.headers.update(MOBILE_HEADERS)
-            resp = session.get(url, allow_redirects=True, timeout=10)
-            final_url = resp.url
-
-            match = re.search(r"/(?:reel|videos)/(\d+)", final_url)
-            if match:
-                reel_id = match.group(1)
-            else:
-                watch_m = re.search(r"[?&]v=(\d+)", final_url)
-                if watch_m:
-                    reel_id = watch_m.group(1)
-                else:
-                    html = resp.text
-                    html_reel = re.search(r'/(?:reel|videos)/(\d+)', html)
-                    if html_reel:
-                        reel_id = html_reel.group(1)
-                    else:
-                        og_match = re.search(r'<meta property="og:url" content="([^"]+)"', html)
-                        if og_match:
-                            og_id = re.search(r'/(?:reel|videos)/(\d+)', og_match.group(1))
-                            if og_id:
-                                reel_id = og_id.group(1)
-        except Exception as e:
-            logger.warning(f"Error resolving Facebook share link {url}: {e}")
-
+            resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X)'}, allow_redirects=True, timeout=10)
+            m2 = re.search(r"/(?:reel|videos)/(\d+)", resp.url) or re.search(r"[?&]v=(\d+)", resp.url)
+            if m2:
+                reel_id = m2.group(1)
+        except Exception:
+            pass
     if reel_id:
-        target = f"https://m.facebook.com/watch/?v={reel_id}"
-        logger.info(f"Facebook URL resolved to mobile watch endpoint: {target}")
-        return target
-
-    url = re.sub(r'[\?&](mibextid|sfnsn|feature|fbclid|si|igsh)=[^&]+', '', url)
-    if url.endswith('?') or url.endswith('&'):
-        url = url[:-1]
-
+        return f"https://m.facebook.com/watch/?v={reel_id}"
     return url
-
-
-def fallback_cobalt_download(url: str, output_path: str, is_audio: bool = False) -> str:
-    """
-    Fallback for YouTube Shorts using Cobalt media nodes.
-    """
-    logger.info(f"Attempting Cobalt fallback for: {url} (audio={is_audio})")
-    cobalt_nodes = [
-        "https://cobalt-api.kwiatekm.pl",
-        "https://api.cobalt.tools",
-        "https://dl.khub.win"
-    ]
-
-    payload = {
-        "url": url,
-        "downloadMode": "audio" if is_audio else "auto"
-    }
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-
-    for node in cobalt_nodes:
-        try:
-            r = requests.post(f"{node}/", json=payload, headers=headers, timeout=12)
-            if r.status_code == 200:
-                data = r.json()
-                stream_url = data.get("url")
-                if stream_url:
-                    logger.info(f"Cobalt resolved stream URL from {node}")
-                    with requests.get(stream_url, stream=True, timeout=40) as s_resp:
-                        s_resp.raise_for_status()
-                        with open(output_path, 'wb') as f:
-                            for chunk in s_resp.iter_content(chunk_size=1024 * 1024):
-                                if chunk:
-                                    f.write(chunk)
-                    return output_path
-        except Exception as e:
-            logger.warning(f"Cobalt node {node} failed: {e}")
-            continue
-
-    raise ValueError("YouTube bot check triggered. Please ensure YOUTUBE_COOKIES is added to Vercel.")
-
 
 def handle_message(message: dict):
     chat_id = message.get("chat", {}).get("id")
     message_id = message.get("message_id")
     text = message.get("text", "").strip()
 
-    logger.info(f"Received message: chat_id={chat_id} text={text}")
-
     if not chat_id:
         return
-
     if text.startswith("/start") or text.startswith("/help"):
-        welcome_text = (
-            "👋 Welcome to Reel & Shorts Downloader Bot!\n\n"
-            "Send me any YouTube Shorts or Facebook Reel link (under 20MB), "
-            "and I will download and send it to you as an MP4 Video or MP3 Audio."
-        )
         send_telegram_request("sendMessage", {
             "chat_id": chat_id,
-            "text": welcome_text
+            "text": "👋 Welcome to Reel & Shorts Downloader Bot!\n\nSend any YouTube Shorts or Facebook Reel link (under 20MB) to download as MP4 or MP3."
         })
         return
 
@@ -193,25 +82,12 @@ def handle_message(message: dict):
     if not found_url:
         send_telegram_request("sendMessage", {
             "chat_id": chat_id,
-            "text": "ℹ️ Please send a valid YouTube Shorts or Facebook Reels link starting with http/https.",
+            "text": "ℹ️ Please send a valid link starting with http/https.",
             "reply_to_message_id": message_id
         })
         return
 
-    parsed = urlparse(found_url)
-    domain = parsed.netloc.lower()
-    allowed_domains = ["youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
-                       "facebook.com", "www.facebook.com", "fb.watch", "m.facebook.com"]
-    if not any(d in domain for d in allowed_domains):
-        send_telegram_request("sendMessage", {
-            "chat_id": chat_id,
-            "text": "⚠️ Unsupported URL. Only YouTube Shorts and Facebook Reels are supported.",
-            "reply_to_message_id": message_id
-        })
-        return
-
-    resolved_url = resolve_facebook_url(found_url) if "facebook.com" in domain or "fb.watch" in domain else found_url
-
+    clean_url = resolve_facebook_url(found_url) if "facebook.com" in found_url or "fb.watch" in found_url else found_url
     keyboard = {
         "inline_keyboard": [
             [
@@ -220,14 +96,12 @@ def handle_message(message: dict):
             ]
         ]
     }
-
     send_telegram_request("sendMessage", {
         "chat_id": chat_id,
-        "text": f"🎬 Choose Download Format:\n{resolved_url}",
+        "text": f"🎬 Choose Download Format:\n{clean_url}",
         "reply_to_message_id": message_id,
         "reply_markup": keyboard
     })
-
 
 def handle_callback_query(callback_query: dict):
     cq_id = callback_query.get("id")
@@ -236,37 +110,18 @@ def handle_callback_query(callback_query: dict):
     chat_id = bot_message.get("chat", {}).get("id")
     bot_msg_id = bot_message.get("message_id")
 
-    logger.info(f"Received callback_query: data={data} chat_id={chat_id}")
-
     send_telegram_request("answerCallbackQuery", {"callback_query_id": cq_id})
-
     if data not in ["dl_mp4", "dl_mp3"]:
         return
 
     reply_to = bot_message.get("reply_to_message", {})
     target_url = extract_url(bot_message.get("text", "")) or extract_url(reply_to.get("text", ""))
-
-    if not target_url:
-        send_telegram_request("editMessageText", {
-            "chat_id": chat_id,
-            "message_id": bot_msg_id,
-            "text": "❌ Could not retrieve original video URL. Please send the link again."
-        })
-        return
-
     clean_target_url = resolve_facebook_url(target_url) if ("facebook.com" in target_url or "fb.watch" in target_url) else target_url
-    logger.info(f"Target URL: {clean_target_url}")
 
     send_telegram_request("editMessageText", {
         "chat_id": chat_id,
         "message_id": bot_msg_id,
         "text": "⏳ Downloading and processing, please wait..."
-    })
-
-    chat_action = "upload_video" if data == "dl_mp4" else "upload_voice"
-    send_telegram_request("sendChatAction", {
-        "chat_id": chat_id,
-        "action": chat_action
     })
 
     unique_id = str(uuid.uuid4())[:8]
@@ -282,29 +137,22 @@ def handle_callback_query(callback_query: dict):
         'socket_timeout': 30,
         'outtmpl': output_template,
         'http_headers': DESKTOP_HEADERS,
-        'extractor_args': {
-            'youtube': {'player_client': ['mweb', 'tv']},
-        }
     }
 
-    # Automatically read YOUTUBE_COOKIES from Vercel Environment Variables
     cookies_env = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookies_env:
         cookies_clean = cookies_env.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\\t', '\t')
         if "# Netscape HTTP Cookie File" not in cookies_clean:
             cookies_clean = "# Netscape HTTP Cookie File\n# YouTube Session\n\n" + cookies_clean
-
         cookies_path = f"/tmp/{unique_id}_cookies.txt"
         with open(cookies_path, "w", encoding="utf-8") as cf:
             cf.write(cookies_clean)
         ydl_opts['cookiefile'] = cookies_path
-        # When cookies are supplied, web/mweb clients are required to send the auth headers
-        ydl_opts['extractor_args'] = {
-            'youtube': {'player_client': ['web', 'mweb']},
-        }
-        logger.info(f"Loaded YOUTUBE_COOKIES ({len(cookies_clean)} chars) to {cookies_path}")
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'mweb']}}
+        logger.info(f"YOUTUBE_COOKIES loaded ({len(cookies_clean)} chars)")
     else:
-        logger.info("No YOUTUBE_COOKIES environment variable found.")
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['mweb', 'tv']}}
+        logger.info("No YOUTUBE_COOKIES found in env")
 
     if is_audio:
         ydl_opts['format'] = 'bestaudio/best'
@@ -312,131 +160,66 @@ def handle_callback_query(callback_query: dict):
         ydl_opts['format'] = 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best'
 
     downloaded_files = []
-    video_title = "Downloaded Media"
-
     try:
-        try:
-            logger.info(f"Extracting with yt-dlp: {clean_target_url} (audio={is_audio})")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(clean_target_url, download=True)
-                video_title = info.get("title", "Downloaded Media")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(clean_target_url, download=True)
+            video_title = info.get("title", "Downloaded Media")
 
-            found_files = glob.glob(f"/tmp/{unique_id}_*")
-            media_files = [f for f in found_files if not f.endswith("_cookies.txt")]
-            if not media_files:
-                raise FileNotFoundError("Downloaded file was not found in storage.")
-            downloaded_filepath = media_files[0]
-
-        except Exception as dl_err:
-            yt_err = str(dl_err)
-            if "youtube" in clean_target_url or "youtu.be" in clean_target_url:
-                logger.warning(f"yt-dlp failed on YouTube ({yt_err}). Triggering fallback...")
-                try:
-                    fallback_file = f"/tmp/{unique_id}_media.mp3" if is_audio else f"/tmp/{unique_id}_media.mp4"
-                    downloaded_filepath = fallback_cobalt_download(clean_target_url, fallback_file, is_audio=is_audio)
-                    video_title = "YouTube Short"
-                except Exception as fb_err:
-                    logger.error(f"Fallback also failed: {fb_err}")
-                    raise ValueError(yt_err)
-            else:
-                raise dl_err
-
+        media_files = [f for f in glob.glob(f"/tmp/{unique_id}_*") if not f.endswith("_cookies.txt")]
+        if not media_files:
+            raise FileNotFoundError("Video could not be downloaded to storage.")
+        downloaded_filepath = media_files[0]
         downloaded_files.append(downloaded_filepath)
-        file_size = os.path.getsize(downloaded_filepath)
 
+        file_size = os.path.getsize(downloaded_filepath)
         if file_size > MAX_FILESIZE_BYTES:
             raise ValueError(f"File size ({file_size / (1024*1024):.1f}MB) exceeds the 20MB limit.")
 
         caption = f"🎬 {video_title}\n\n⚡ Downloaded via Telegram Downloader"
-
         if is_audio:
-            with open(downloaded_filepath, "rb") as audio_file:
-                files = {"audio": (os.path.basename(downloaded_filepath), audio_file, "audio/mpeg")}
-                data_payload = {
-                    "chat_id": chat_id,
-                    "caption": caption[:1024],
-                    "title": video_title[:64]
-                }
-                send_telegram_request("sendAudio", data=data_payload, files=files, timeout=50)
+            with open(downloaded_filepath, "rb") as af:
+                send_telegram_request("sendAudio", data={"chat_id": chat_id, "caption": caption[:1024], "title": video_title[:64]}, files={"audio": (os.path.basename(downloaded_filepath), af, "audio/mpeg")})
         else:
-            with open(downloaded_filepath, "rb") as vid_file:
-                files = {"video": (os.path.basename(downloaded_filepath), vid_file, "video/mp4")}
-                data_payload = {
-                    "chat_id": chat_id,
-                    "caption": caption[:1024],
-                    "supports_streaming": "true"
-                }
-                send_telegram_request("sendVideo", data=data_payload, files=files, timeout=50)
+            with open(downloaded_filepath, "rb") as vf:
+                send_telegram_request("sendVideo", data={"chat_id": chat_id, "caption": caption[:1024], "supports_streaming": "true"}, files={"video": (os.path.basename(downloaded_filepath), vf, "video/mp4")})
 
-        send_telegram_request("deleteMessage", {
-            "chat_id": chat_id,
-            "message_id": bot_msg_id
-        })
+        send_telegram_request("deleteMessage", {"chat_id": chat_id, "message_id": bot_msg_id})
 
     except Exception as err:
-        logger.error(f"Error in download/delivery: {err}", exc_info=True)
+        logger.error(f"Download failure: {err}")
         send_telegram_request("editMessageText", {
             "chat_id": chat_id,
             "message_id": bot_msg_id,
-            "text": f"❌ Failed to process video:\n{str(err)}"
+            "text": f"❌ YouTube Error: {str(err)}"
         })
 
     finally:
         for f in downloaded_files:
             try:
-                if os.path.exists(f):
-                    os.remove(f)
+                os.remove(f)
             except Exception:
                 pass
         for extra in glob.glob(f"/tmp/{unique_id}_*"):
             try:
-                if os.path.exists(extra):
-                    os.remove(extra)
+                os.remove(extra)
             except Exception:
                 pass
-
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
 def webhook_handler(path=""):
     if request.method == "GET":
-        token_configured = bool(TELEGRAM_BOT_TOKEN)
-        return jsonify({
-            "status": "healthy",
-            "bot": "Telegram Video Downloader Webhook",
-            "telegram_token_configured": token_configured,
-            "received_path": path
-        }), 200
-
+        return jsonify({"status": "healthy", "cookies_detected": bool(os.environ.get("YOUTUBE_COOKIES"))}), 200
     try:
         update = request.get_json(force=True, silent=True)
-        logger.info(f"Incoming Telegram webhook update on path '{path}': {update}")
-
-        if not update:
-            logger.warning("Empty or non-JSON webhook body received.")
-            return jsonify({"ok": True}), 200
-
-        if not TELEGRAM_BOT_TOKEN:
-            logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is missing in Vercel Environment Variables!")
-
-        if "message" in update:
-            handle_message(update["message"])
-        elif "callback_query" in update:
-            handle_callback_query(update["callback_query"])
-
+        if update:
+            if "message" in update:
+                handle_message(update["message"])
+            elif "callback_query" in update:
+                handle_callback_query(update["callback_query"])
     except Exception as e:
-        logger.error(f"Webhook processing exception: {e}", exc_info=True)
-
+        logger.error(f"Webhook error: {e}")
     return jsonify({"ok": True}), 200
-
-
-@app.errorhandler(404)
-def handle_not_found(e):
-    return webhook_handler(path=request.path)
-
 
 handler = app
 application = app
-
-if __name__ == "__main__":
-    app.run(port=5000)
