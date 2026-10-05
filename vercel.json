@@ -3,11 +3,11 @@
   "rewrites": [
     {
       "source": "/(.*)",
-      "destination": "/api/webhook.py"
+      "destination": "/api/index.py"
     }
   ],
   "functions": {
-    "api/webhook.py": {
+    "api/index.py": {
       "maxDuration": 60
     }
   }
