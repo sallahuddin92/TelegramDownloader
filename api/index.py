@@ -2,7 +2,8 @@
 api/index.py
 Flask-based Vercel Serverless Telegram Bot Webhook
 Downloads YouTube Shorts & Facebook Reels under 20MB and sends directly to Telegram.
-Uses m.facebook.com endpoint and TLS impersonation to prevent UNEXPECTED_EOF_WHILE_READING.
+Includes m.facebook.com routing, YouTube player_client rotation (mweb, tv),
+and multi-instance Cobalt fallback to bypass YouTube bot detection without cookies.
 """
 
 import os
@@ -69,7 +70,6 @@ def resolve_facebook_url(raw_url: str) -> str:
     """
     Resolves Facebook /share/r/ or fb.watch links and converts to mobile
     https://m.facebook.com/watch/?v=<id>.
-    m.facebook.com does NOT drop TLS connections unlike www.facebook.com.
     """
     url = raw_url.strip().rstrip(").,;!?\"'")
     reel_id = None
@@ -121,6 +121,51 @@ def resolve_facebook_url(raw_url: str) -> str:
         url = url[:-1]
 
     return url
+
+
+def fallback_cobalt_download(url: str, output_path: str, is_audio: bool = False) -> str:
+    """
+    Fallback for YouTube Shorts if datacenter IP triggers 'Sign in to confirm you’re not a bot'.
+    Streams directly via public Cobalt nodes without requiring cookies.
+    """
+    logger.info(f"Attempting Cobalt fallback for: {url} (audio={is_audio})")
+    cobalt_nodes = [
+        "https://cobalt-api.kwiatekm.pl",
+        "https://api.cobalt.tools",
+        "https://dl.khub.win"
+    ]
+
+    payload = {
+        "url": url,
+        "downloadMode": "audio" if is_audio else "auto"
+    }
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    for node in cobalt_nodes:
+        try:
+            r = requests.post(f"{node}/", json=payload, headers=headers, timeout=12)
+            if r.status_code == 200:
+                data = r.json()
+                stream_url = data.get("url")
+                if stream_url:
+                    logger.info(f"Cobalt resolved stream URL from {node}")
+                    with requests.get(stream_url, stream=True, timeout=40) as s_resp:
+                        s_resp.raise_for_status()
+                        with open(output_path, 'wb') as f:
+                            for chunk in s_resp.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                    return output_path
+        except Exception as e:
+            logger.warning(f"Cobalt node {node} failed: {e}")
+            continue
+
+    raise ValueError("YouTube bot check triggered. Please try again in a moment.")
 
 
 def handle_message(message: dict):
@@ -210,7 +255,7 @@ def handle_callback_query(callback_query: dict):
         })
         return
 
-    clean_target_url = resolve_facebook_url(target_url)
+    clean_target_url = resolve_facebook_url(target_url) if ("facebook.com" in target_url or "fb.watch" in target_url) else target_url
     logger.info(f"Target URL: {clean_target_url}")
 
     send_telegram_request("editMessageText", {
@@ -239,9 +284,16 @@ def handle_callback_query(callback_query: dict):
         'outtmpl': output_template,
         'http_headers': DESKTOP_HEADERS,
         'extractor_args': {
-            'youtube': {'player_client': ['android', 'web']},
+            'youtube': {'player_client': ['mweb', 'tv', 'tv_embedded']},
         }
     }
+
+    cookies_env = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if cookies_env:
+        cookies_path = f"/tmp/{unique_id}_cookies.txt"
+        with open(cookies_path, "w") as cf:
+            cf.write(cookies_env)
+        ydl_opts['cookiefile'] = cookies_path
 
     if is_audio:
         ydl_opts['format'] = 'bestaudio/best'
@@ -252,19 +304,30 @@ def handle_callback_query(callback_query: dict):
     video_title = "Downloaded Media"
 
     try:
-        logger.info(f"Extracting video: {clean_target_url} (audio={is_audio})")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(clean_target_url, download=True)
-            video_title = info.get("title", "Downloaded Media")
+        try:
+            logger.info(f"Extracting with yt-dlp: {clean_target_url} (audio={is_audio})")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(clean_target_url, download=True)
+                video_title = info.get("title", "Downloaded Media")
 
-        found_files = glob.glob(f"/tmp/{unique_id}_*")
-        if not found_files:
-            raise FileNotFoundError("Downloaded file was not found in storage.")
+            found_files = glob.glob(f"/tmp/{unique_id}_*")
+            media_files = [f for f in found_files if not f.endswith("_cookies.txt")]
+            if not media_files:
+                raise FileNotFoundError("Downloaded file was not found in storage.")
+            downloaded_filepath = media_files[0]
 
-        downloaded_filepath = found_files[0]
+        except Exception as dl_err:
+            if "youtube" in clean_target_url or "youtu.be" in clean_target_url:
+                logger.warning(f"yt-dlp failed on YouTube ({dl_err}). Triggering fallback resolver...")
+                fallback_file = f"/tmp/{unique_id}_media.mp3" if is_audio else f"/tmp/{unique_id}_media.mp4"
+                downloaded_filepath = fallback_cobalt_download(clean_target_url, fallback_file, is_audio=is_audio)
+                video_title = "YouTube Short"
+            else:
+                raise dl_err
+
         downloaded_files.append(downloaded_filepath)
-
         file_size = os.path.getsize(downloaded_filepath)
+
         if file_size > MAX_FILESIZE_BYTES:
             raise ValueError(f"File size ({file_size / (1024*1024):.1f}MB) exceeds the 20MB limit.")
 
