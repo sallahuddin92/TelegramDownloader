@@ -155,9 +155,9 @@ def handle_callback_query(callback_query: dict):
         logger.info("No YOUTUBE_COOKIES found in env")
 
     if is_audio:
-        ydl_opts['format'] = 'bestaudio/best'
+        ydl_opts['format'] = 'bestaudio/best/b'
     else:
-        ydl_opts['format'] = 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best'
+        ydl_opts['format'] = 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best/b'
 
     downloaded_files = []
     try:
