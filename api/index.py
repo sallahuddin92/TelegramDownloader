@@ -277,5 +277,10 @@ def webhook_handler():
     return jsonify({"ok": True}), 200
 
 
+@app.errorhandler(404)
+def handle_not_found(e):
+    return webhook_handler(path=request.path)
+
+
 handler = app
 application = app
