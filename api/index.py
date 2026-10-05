@@ -277,42 +277,58 @@ def handle_callback_query(callback_query: dict):
                 pass
 
 
-class handler(BaseHTTPRequestHandler):
-    """Vercel Python Serverless Function entrypoint."""
+# Standard WSGI Application Entrypoint for Vercel
+def app(environ, start_response):
+    method = environ.get("REQUEST_METHOD", "GET").upper()
 
-    def _send_json(self, status: int, data: dict):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
-
-    def do_GET(self):
-        """Health check endpoint."""
-        self._send_json(200, {
+    if method == "GET":
+        status = "200 OK"
+        response_body = json.dumps({
             "status": "healthy",
             "bot": "Telegram Video Downloader Webhook",
             "supported_types": ["YouTube Shorts", "Facebook Reels"]
-        })
+        }).encode("utf-8")
+        headers = [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(response_body)))
+        ]
+        start_response(status, headers)
+        return [response_body]
 
-    def do_POST(self):
-        """Telegram Webhook handler."""
+    elif method == "POST":
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length).decode("utf-8")
+            content_length = int(environ.get("CONTENT_LENGTH", 0) or 0)
+        except (ValueError, TypeError):
+            content_length = 0
 
-            if not body:
-                self._send_json(200, {"ok": True})
-                return
+        body_bytes = environ["wsgi.input"].read(content_length) if content_length > 0 else b""
+        body_text = body_bytes.decode("utf-8", errors="ignore")
 
-            update = json.loads(body)
+        if body_text:
+            try:
+                update = json.loads(body_text)
+                if "message" in update:
+                    handle_message(update["message"])
+                elif "callback_query" in update:
+                    handle_callback_query(update["callback_query"])
+            except Exception as e:
+                logger.error(f"Webhook processing error: {e}", exc_info=True)
 
-            if "message" in update:
-                handle_message(update["message"])
-            elif "callback_query" in update:
-                handle_callback_query(update["callback_query"])
+        status = "200 OK"
+        response_body = json.dumps({"ok": True}).encode("utf-8")
+        headers = [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(response_body)))
+        ]
+        start_response(status, headers)
+        return [response_body]
 
-            self._send_json(200, {"ok": True})
+    status = "405 Method Not Allowed"
+    response_body = b"Method Not Allowed"
+    start_response(status, [("Content-Type", "text/plain"), ("Content-Length", str(len(response_body)))])
+    return [response_body]
 
-        except Exception as e:
-            logger.error(f"Webhook processing error: {e}", exc_info=True)
-            self._send_json(200, {"ok": False, "error": str(e)})
+
+# Top-level variables required by Vercel Function runtime
+handler = app
+application = app
