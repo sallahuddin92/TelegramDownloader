@@ -1,34 +1,36 @@
 """
 api/index.py
-Production-ready Vercel Python Serverless Telegram Bot Webhook
+Flask-based Vercel Serverless Telegram Bot Webhook
 Downloads YouTube Shorts & Facebook Reels under 20MB and sends directly to Telegram.
+Exports: app, handler, application
 """
 
 import os
 import re
-import json
 import glob
 import uuid
 import logging
-from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
+from flask import Flask, request, jsonify
 import requests
 import yt_dlp
 from fp.fp import FreeProxy
 
-# Configure logging
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telegram_webhook_bot")
+
+# Initialize Flask app
+app = Flask(__name__)
 
 # Config & Limits
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-MAX_FILESIZE_BYTES = 20 * 1024 * 1024  # 20MB Telegram bot API limit
+MAX_FILESIZE_BYTES = 20 * 1024 * 1024  # 20MB limit
 
 
 def send_telegram_request(method: str, data: dict = None, files: dict = None, timeout: int = 40):
-    """Helper to send requests to Telegram Bot API."""
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set.")
         return None
@@ -45,15 +47,10 @@ def send_telegram_request(method: str, data: dict = None, files: dict = None, ti
 
 
 def get_proxy():
-    """
-    Attempts to scrape a free working HTTPS proxy using free-proxy.
-    Falls back gracefully to direct connection (None) if scraping times out or fails.
-    """
     try:
         logger.info("Scraping proxy via free-proxy...")
         proxy = FreeProxy(country_id=None, timeout=2.0, rand=True, https=True).get()
         if proxy:
-            logger.info(f"Obtained proxy: {proxy}")
             return proxy
     except Exception as e:
         logger.warning(f"Free-proxy lookup failed: {e}. Falling back to direct connection.")
@@ -61,7 +58,6 @@ def get_proxy():
 
 
 def extract_url(text: str) -> str:
-    """Extracts first http/https URL from text."""
     if not text:
         return ""
     match = re.search(r"https?://[^\s]+", text)
@@ -69,7 +65,6 @@ def extract_url(text: str) -> str:
 
 
 def handle_message(message: dict):
-    """Processes incoming text messages."""
     chat_id = message.get("chat", {}).get("id")
     message_id = message.get("message_id")
     text = message.get("text", "").strip()
@@ -77,14 +72,11 @@ def handle_message(message: dict):
     if not chat_id:
         return
 
-    # Handle /start or /help commands
     if text.startswith("/start") or text.startswith("/help"):
         welcome_text = (
-            "👋 *Welcome to Reel & Shorts Downloader Bot\!*
-
-"
-            "Send me any *YouTube Shorts* or *Facebook Reel* link \(under 20MB\), "
-            "and I will download and send it to you as an *MP4 Video* or *MP3 Audio*\."
+            "👋 *Welcome to Reel & Shorts Downloader Bot\\!*\n\n"
+            "Send me any *YouTube Shorts* or *Facebook Reel* link \\(under 20MB\\), "
+            "and I will download and send it to you as an *MP4 Video* or *MP3 Audio*\\."
         )
         send_telegram_request("sendMessage", {
             "chat_id": chat_id,
@@ -93,7 +85,6 @@ def handle_message(message: dict):
         })
         return
 
-    # Check for URLs
     found_url = extract_url(text)
     if not found_url:
         send_telegram_request("sendMessage", {
@@ -103,7 +94,6 @@ def handle_message(message: dict):
         })
         return
 
-    # Validate domain
     parsed = urlparse(found_url)
     domain = parsed.netloc.lower()
     allowed_domains = ["youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
@@ -116,7 +106,6 @@ def handle_message(message: dict):
         })
         return
 
-    # Present Inline Keyboard with MP4 / MP3 options
     keyboard = {
         "inline_keyboard": [
             [
@@ -136,20 +125,17 @@ def handle_message(message: dict):
 
 
 def handle_callback_query(callback_query: dict):
-    """Processes button clicks from inline keyboards."""
     cq_id = callback_query.get("id")
     data = callback_query.get("data", "")
     bot_message = callback_query.get("message", {})
     chat_id = bot_message.get("chat", {}).get("id")
     bot_msg_id = bot_message.get("message_id")
 
-    # Acknowledge callback immediately to remove loading spinner in Telegram
     send_telegram_request("answerCallbackQuery", {"callback_query_id": cq_id})
 
     if data not in ["dl_mp4", "dl_mp3"]:
         return
 
-    # Extract target URL from the original message that was replied to
     reply_to = bot_message.get("reply_to_message", {})
     target_url = extract_url(reply_to.get("text", "")) or extract_url(reply_to.get("caption", ""))
 
@@ -164,21 +150,18 @@ def handle_callback_query(callback_query: dict):
         })
         return
 
-    # 1. Wait State: Edit button message
     send_telegram_request("editMessageText", {
         "chat_id": chat_id,
         "message_id": bot_msg_id,
         "text": "⏳ Downloading and processing, please wait..."
     })
 
-    # Trigger chat action
     chat_action = "upload_video" if data == "dl_mp4" else "upload_voice"
     send_telegram_request("sendChatAction", {
         "chat_id": chat_id,
         "action": chat_action
     })
 
-    # 2. Download Engine
     unique_id = str(uuid.uuid4())[:8]
     output_template = f"/tmp/{unique_id}_%(id)s.%(ext)s"
     proxy = get_proxy()
@@ -206,7 +189,6 @@ def handle_callback_query(callback_query: dict):
     downloaded_files = []
 
     try:
-        logger.info(f"Starting extraction for URL: {target_url} (audio={is_audio})")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=True)
             video_title = info.get("title", "Downloaded Media")
@@ -219,14 +201,11 @@ def handle_callback_query(callback_query: dict):
         downloaded_files.append(downloaded_filepath)
 
         file_size = os.path.getsize(downloaded_filepath)
-        logger.info(f"Downloaded file: {downloaded_filepath} ({file_size} bytes)")
-
         if file_size > MAX_FILESIZE_BYTES:
-            raise ValueError(f"File size ({file_size / (1024*1024):.1f}MB) exceeds the 20MB Telegram limit.")
+            raise ValueError(f"File size ({file_size / (1024*1024):.1f}MB) exceeds the 20MB limit.")
 
-        caption = f"🎬 {video_title}\n\n⚡ Downloaded via @TelegramDownloader"
+        caption = f"🎬 {video_title}\n\n⚡ Downloaded via Telegram Downloader"
 
-        # 3. Delivery via Telegram API
         if is_audio:
             with open(downloaded_filepath, "rb") as audio_file:
                 files = {"audio": (os.path.basename(downloaded_filepath), audio_file, "audio/mpeg")}
@@ -246,7 +225,6 @@ def handle_callback_query(callback_query: dict):
                 }
                 send_telegram_request("sendVideo", data=data_payload, files=files, timeout=50)
 
-        # 4. Delete the "⏳ Downloading..." message
         send_telegram_request("deleteMessage", {
             "chat_id": chat_id,
             "message_id": bot_msg_id
@@ -265,10 +243,8 @@ def handle_callback_query(callback_query: dict):
             try:
                 if os.path.exists(f):
                     os.remove(f)
-                    logger.info(f"Deleted /tmp file: {f}")
             except Exception:
                 pass
-
         for extra in glob.glob(f"/tmp/{unique_id}_*"):
             try:
                 if os.path.exists(extra):
@@ -277,58 +253,29 @@ def handle_callback_query(callback_query: dict):
                 pass
 
 
-# Standard WSGI Application Entrypoint for Vercel
-def app(environ, start_response):
-    method = environ.get("REQUEST_METHOD", "GET").upper()
-
-    if method == "GET":
-        status = "200 OK"
-        response_body = json.dumps({
+@app.route("/", methods=["GET", "POST"])
+@app.route("/api/webhook", methods=["GET", "POST"])
+@app.route("/api/index", methods=["GET", "POST"])
+def webhook_handler():
+    if request.method == "GET":
+        return jsonify({
             "status": "healthy",
             "bot": "Telegram Video Downloader Webhook",
-            "supported_types": ["YouTube Shorts", "Facebook Reels"]
-        }).encode("utf-8")
-        headers = [
-            ("Content-Type", "application/json"),
-            ("Content-Length", str(len(response_body)))
-        ]
-        start_response(status, headers)
-        return [response_body]
+            "framework": "Flask on Vercel"
+        }), 200
 
-    elif method == "POST":
-        try:
-            content_length = int(environ.get("CONTENT_LENGTH", 0) or 0)
-        except (ValueError, TypeError):
-            content_length = 0
+    try:
+        update = request.get_json(force=True, silent=True)
+        if update:
+            if "message" in update:
+                handle_message(update["message"])
+            elif "callback_query" in update:
+                handle_callback_query(update["callback_query"])
+    except Exception as e:
+        logger.error(f"Webhook handling exception: {e}", exc_info=True)
 
-        body_bytes = environ["wsgi.input"].read(content_length) if content_length > 0 else b""
-        body_text = body_bytes.decode("utf-8", errors="ignore")
-
-        if body_text:
-            try:
-                update = json.loads(body_text)
-                if "message" in update:
-                    handle_message(update["message"])
-                elif "callback_query" in update:
-                    handle_callback_query(update["callback_query"])
-            except Exception as e:
-                logger.error(f"Webhook processing error: {e}", exc_info=True)
-
-        status = "200 OK"
-        response_body = json.dumps({"ok": True}).encode("utf-8")
-        headers = [
-            ("Content-Type", "application/json"),
-            ("Content-Length", str(len(response_body)))
-        ]
-        start_response(status, headers)
-        return [response_body]
-
-    status = "405 Method Not Allowed"
-    response_body = b"Method Not Allowed"
-    start_response(status, [("Content-Type", "text/plain"), ("Content-Length", str(len(response_body)))])
-    return [response_body]
+    return jsonify({"ok": True}), 200
 
 
-# Top-level variables required by Vercel Function runtime
 handler = app
 application = app
