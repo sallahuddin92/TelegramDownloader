@@ -2,7 +2,7 @@
 api/index.py
 Flask-based Vercel Serverless Telegram Bot Webhook
 Downloads YouTube Shorts & Facebook Reels under 20MB and sends directly to Telegram.
-Exports: app, handler, application
+Uses m.facebook.com endpoint and TLS impersonation to prevent UNEXPECTED_EOF_WHILE_READING.
 """
 
 import os
@@ -15,7 +15,6 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 import requests
 import yt_dlp
-from fp.fp import FreeProxy
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -29,10 +28,22 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 MAX_FILESIZE_BYTES = 20 * 1024 * 1024  # 20MB limit
 
+DESKTOP_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+MOBILE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
 
 def send_telegram_request(method: str, data: dict = None, files: dict = None, timeout: int = 40):
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN is not set.")
+        logger.error("CRITICAL: TELEGRAM_BOT_TOKEN environment variable is not set in Vercel settings!")
         return None
     url = f"{TELEGRAM_API_BASE}/{method}"
     try:
@@ -42,26 +53,74 @@ def send_telegram_request(method: str, data: dict = None, files: dict = None, ti
             res = requests.post(url, json=data, timeout=timeout)
         return res.json()
     except Exception as e:
-        logger.error(f"Error calling Telegram method {method}: {e}")
+        logger.error(f"Error calling Telegram method {method}: {e}", exc_info=True)
         return None
 
 
-def get_proxy():
-    try:
-        logger.info("Scraping proxy via free-proxy...")
-        proxy = FreeProxy(country_id=None, timeout=2.0, rand=True, https=True).get()
-        if proxy:
-            return proxy
-    except Exception as e:
-        logger.warning(f"Free-proxy lookup failed: {e}. Falling back to direct connection.")
-    return None
-
-
 def extract_url(text: str) -> str:
+    """Extracts first http/https URL from text."""
     if not text:
         return ""
     match = re.search(r"https?://[^\s]+", text)
     return match.group(0) if match else ""
+
+
+def resolve_facebook_url(raw_url: str) -> str:
+    """
+    Resolves Facebook /share/r/ or fb.watch links and converts to mobile
+    https://m.facebook.com/watch/?v=<id>.
+    m.facebook.com does NOT drop TLS connections unlike www.facebook.com.
+    """
+    url = raw_url.strip().rstrip(").,;!?\"'")
+    reel_id = None
+
+    match_direct = re.search(r"/(?:reel|videos)/(\d+)", url)
+    if match_direct:
+        reel_id = match_direct.group(1)
+
+    watch_direct = re.search(r"[?&]v=(\d+)", url)
+    if watch_direct:
+        reel_id = watch_direct.group(1)
+
+    if not reel_id and ("facebook.com/share" in url or "fb.watch" in url):
+        try:
+            logger.info(f"Resolving Facebook share link: {url}")
+            session = requests.Session()
+            session.headers.update(MOBILE_HEADERS)
+            resp = session.get(url, allow_redirects=True, timeout=10)
+            final_url = resp.url
+
+            match = re.search(r"/(?:reel|videos)/(\d+)", final_url)
+            if match:
+                reel_id = match.group(1)
+            else:
+                watch_m = re.search(r"[?&]v=(\d+)", final_url)
+                if watch_m:
+                    reel_id = watch_m.group(1)
+                else:
+                    html = resp.text
+                    html_reel = re.search(r'/(?:reel|videos)/(\d+)', html)
+                    if html_reel:
+                        reel_id = html_reel.group(1)
+                    else:
+                        og_match = re.search(r'<meta property="og:url" content="([^"]+)"', html)
+                        if og_match:
+                            og_id = re.search(r'/(?:reel|videos)/(\d+)', og_match.group(1))
+                            if og_id:
+                                reel_id = og_id.group(1)
+        except Exception as e:
+            logger.warning(f"Error resolving Facebook share link {url}: {e}")
+
+    if reel_id:
+        target = f"https://m.facebook.com/watch/?v={reel_id}"
+        logger.info(f"Facebook URL resolved to mobile watch endpoint: {target}")
+        return target
+
+    url = re.sub(r'[\?&](mibextid|sfnsn|feature|fbclid|si|igsh)=[^&]+', '', url)
+    if url.endswith('?') or url.endswith('&'):
+        url = url[:-1]
+
+    return url
 
 
 def handle_message(message: dict):
@@ -69,19 +128,20 @@ def handle_message(message: dict):
     message_id = message.get("message_id")
     text = message.get("text", "").strip()
 
+    logger.info(f"Received message: chat_id={chat_id} text={text}")
+
     if not chat_id:
         return
 
     if text.startswith("/start") or text.startswith("/help"):
         welcome_text = (
-            "👋 *Welcome to Reel & Shorts Downloader Bot\\!*\n\n"
-            "Send me any *YouTube Shorts* or *Facebook Reel* link \\(under 20MB\\), "
-            "and I will download and send it to you as an *MP4 Video* or *MP3 Audio*\\."
+            "👋 Welcome to Reel & Shorts Downloader Bot!\n\n"
+            "Send me any YouTube Shorts or Facebook Reel link (under 20MB), "
+            "and I will download and send it to you as an MP4 Video or MP3 Audio."
         )
         send_telegram_request("sendMessage", {
             "chat_id": chat_id,
-            "text": welcome_text,
-            "parse_mode": "MarkdownV2"
+            "text": welcome_text
         })
         return
 
@@ -106,6 +166,8 @@ def handle_message(message: dict):
         })
         return
 
+    resolved_url = resolve_facebook_url(found_url) if "facebook.com" in domain or "fb.watch" in domain else found_url
+
     keyboard = {
         "inline_keyboard": [
             [
@@ -117,8 +179,7 @@ def handle_message(message: dict):
 
     send_telegram_request("sendMessage", {
         "chat_id": chat_id,
-        "text": f"🎬 *Choose Download Format:*\n`{found_url}`",
-        "parse_mode": "Markdown",
+        "text": f"🎬 Choose Download Format:\n{resolved_url}",
         "reply_to_message_id": message_id,
         "reply_markup": keyboard
     })
@@ -131,16 +192,15 @@ def handle_callback_query(callback_query: dict):
     chat_id = bot_message.get("chat", {}).get("id")
     bot_msg_id = bot_message.get("message_id")
 
+    logger.info(f"Received callback_query: data={data} chat_id={chat_id}")
+
     send_telegram_request("answerCallbackQuery", {"callback_query_id": cq_id})
 
     if data not in ["dl_mp4", "dl_mp3"]:
         return
 
     reply_to = bot_message.get("reply_to_message", {})
-    target_url = extract_url(reply_to.get("text", "")) or extract_url(reply_to.get("caption", ""))
-
-    if not target_url:
-        target_url = extract_url(bot_message.get("text", ""))
+    target_url = extract_url(bot_message.get("text", "")) or extract_url(reply_to.get("text", ""))
 
     if not target_url:
         send_telegram_request("editMessageText", {
@@ -149,6 +209,9 @@ def handle_callback_query(callback_query: dict):
             "text": "❌ Could not retrieve original video URL. Please send the link again."
         })
         return
+
+    clean_target_url = resolve_facebook_url(target_url)
+    logger.info(f"Target URL: {clean_target_url}")
 
     send_telegram_request("editMessageText", {
         "chat_id": chat_id,
@@ -164,8 +227,6 @@ def handle_callback_query(callback_query: dict):
 
     unique_id = str(uuid.uuid4())[:8]
     output_template = f"/tmp/{unique_id}_%(id)s.%(ext)s"
-    proxy = get_proxy()
-
     is_audio = (data == "dl_mp3")
 
     ydl_opts = {
@@ -174,8 +235,12 @@ def handle_callback_query(callback_query: dict):
         'no_warnings': True,
         'max_filesize': MAX_FILESIZE_BYTES,
         'noplaylist': True,
-        'socket_timeout': 15,
+        'socket_timeout': 30,
         'outtmpl': output_template,
+        'http_headers': DESKTOP_HEADERS,
+        'extractor_args': {
+            'youtube': {'player_client': ['android', 'web']},
+        }
     }
 
     if is_audio:
@@ -183,19 +248,18 @@ def handle_callback_query(callback_query: dict):
     else:
         ydl_opts['format'] = 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best'
 
-    if proxy:
-        ydl_opts['proxy'] = proxy
-
     downloaded_files = []
+    video_title = "Downloaded Media"
 
     try:
+        logger.info(f"Extracting video: {clean_target_url} (audio={is_audio})")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target_url, download=True)
+            info = ydl.extract_info(clean_target_url, download=True)
             video_title = info.get("title", "Downloaded Media")
 
         found_files = glob.glob(f"/tmp/{unique_id}_*")
         if not found_files:
-            raise FileNotFoundError("File was not saved to /tmp.")
+            raise FileNotFoundError("Downloaded file was not found in storage.")
 
         downloaded_filepath = found_files[0]
         downloaded_files.append(downloaded_filepath)
@@ -253,26 +317,36 @@ def handle_callback_query(callback_query: dict):
                 pass
 
 
-@app.route("/", methods=["GET", "POST"])
-@app.route("/api/webhook", methods=["GET", "POST"])
-@app.route("/api/index", methods=["GET", "POST"])
-def webhook_handler():
+@app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
+@app.route("/<path:path>", methods=["GET", "POST"])
+def webhook_handler(path=""):
     if request.method == "GET":
+        token_configured = bool(TELEGRAM_BOT_TOKEN)
         return jsonify({
             "status": "healthy",
             "bot": "Telegram Video Downloader Webhook",
-            "framework": "Flask on Vercel"
+            "telegram_token_configured": token_configured,
+            "received_path": path
         }), 200
 
     try:
         update = request.get_json(force=True, silent=True)
-        if update:
-            if "message" in update:
-                handle_message(update["message"])
-            elif "callback_query" in update:
-                handle_callback_query(update["callback_query"])
+        logger.info(f"Incoming Telegram webhook update on path '{path}': {update}")
+
+        if not update:
+            logger.warning("Empty or non-JSON webhook body received.")
+            return jsonify({"ok": True}), 200
+
+        if not TELEGRAM_BOT_TOKEN:
+            logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is missing in Vercel Environment Variables!")
+
+        if "message" in update:
+            handle_message(update["message"])
+        elif "callback_query" in update:
+            handle_callback_query(update["callback_query"])
+
     except Exception as e:
-        logger.error(f"Webhook handling exception: {e}", exc_info=True)
+        logger.error(f"Webhook processing exception: {e}", exc_info=True)
 
     return jsonify({"ok": True}), 200
 
@@ -284,3 +358,6 @@ def handle_not_found(e):
 
 handler = app
 application = app
+
+if __name__ == "__main__":
+    app.run(port=5000)
