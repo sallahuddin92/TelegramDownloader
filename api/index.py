@@ -139,6 +139,20 @@ def handle_callback_query(callback_query: dict):
         'http_headers': DESKTOP_HEADERS,
     }
 
+    proxy_env = os.environ.get("PROXY", "").strip()
+    if proxy_env:
+        ydl_opts['proxy'] = proxy_env
+        logger.info("Custom proxy enabled for yt-dlp")
+
+    po_token_env = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
+    yt_extractor_args = {
+        'player_client': ['ios', 'android', 'tv_embedded', 'tv', 'mweb']
+    }
+    if po_token_env:
+        yt_extractor_args['po_token'] = [f"web+{po_token_env}"]
+        yt_extractor_args['player_client'] = ['web', 'tv_embedded', 'tv', 'mweb']
+        logger.info("YOUTUBE_PO_TOKEN loaded")
+
     cookies_env = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookies_env:
         cookies_clean = cookies_env.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\\t', '\t')
@@ -148,11 +162,11 @@ def handle_callback_query(callback_query: dict):
         with open(cookies_path, "w", encoding="utf-8") as cf:
             cf.write(cookies_clean)
         ydl_opts['cookiefile'] = cookies_path
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['tv_embedded', 'tv', 'mweb', 'ios', 'android']}}
         logger.info(f"YOUTUBE_COOKIES loaded ({len(cookies_clean)} chars)")
     else:
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['tv_embedded', 'tv', 'mweb', 'ios', 'android']}}
         logger.info("No YOUTUBE_COOKIES found in env")
+
+    ydl_opts['extractor_args'] = {'youtube': yt_extractor_args}
 
     if is_audio:
         ydl_opts['format'] = 'bestaudio/best/b'
