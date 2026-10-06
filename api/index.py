@@ -223,7 +223,11 @@ def handle_callback_query(callback_query: dict):
 @app.route("/<path:path>", methods=["GET", "POST"])
 def webhook_handler(path=""):
     if request.method == "GET":
-        return jsonify({"status": "healthy", "cookies_detected": bool(os.environ.get("YOUTUBE_COOKIES"))}), 200
+        return jsonify({
+            "status": "healthy",
+            "cookies_detected": bool(os.environ.get("YOUTUBE_COOKIES")),
+            "proxy_detected": bool(os.environ.get("PROXY"))
+        }), 200
     try:
         update = request.get_json(force=True, silent=True)
         if update:
